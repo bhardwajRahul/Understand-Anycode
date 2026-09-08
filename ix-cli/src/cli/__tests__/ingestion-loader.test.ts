@@ -47,10 +47,60 @@ describe("isVmDynamicImportUnavailable", () => {
     // test, never reaches the message test, and the fallback never fires on the
     // one host it is for.
     const original = (await realVmFailure()) as Error;
+    // Guarded for the same reason test 1 asserts it: if the host ever gains a
+    // dynamic-import hook this is `null`, and `original.message` would fail
+    // with an opaque TypeError instead of naming the cause.
+    expect(original, "expected the vm indirection to fail under vite-node").not.toBeNull();
     const wrapped = new Error(original.message, { cause: original });
     (wrapped as NodeJS.ErrnoException).code = "ERR_LOAD_URL";
 
     expect(isVmDynamicImportUnavailable(wrapped)).toBe(true);
+  });
+
+  it("matches on the CODE alone, when the message no longer says anything", async () => {
+    // The case that makes the code check load-bearing. The real error carries
+    // BOTH a matching code and a matching message, so `||` short-circuits on
+    // the message and the code clause is never reached: deleting it left this
+    // file 4/4 green. That is not a hypothetical gap -- a later "simplification"
+    // back to a message-only match is exactly the pre-#613 form, ships green,
+    // and then Node rewords the message and the fallback silently stops firing.
+    //
+    // Derived, like the others: the real error with its real code, and only the
+    // message replaced.
+    const original = (await realVmFailure()) as Error;
+    expect(original, "expected the vm indirection to fail under vite-node").not.toBeNull();
+    // The premise, asserted rather than assumed -- every other test here does
+    // the same. Without it, the day vite-node wraps this failure under its
+    // own code (which is precisely why test 2 exists) or Node renames it, this
+    // fails as a bare `expected false to be true` pointing at the predicate,
+    // when what changed is the input.
+    // `typeof` as well as the value, because the predicate demands a STRING
+    // `code` before it calls `startsWith`. Asserting only `String(code)`
+    // passes on a non-string that stringifies the same way -- exactly the
+    // shape the NUMERIC-code test below exists for -- and the failure would
+    // then land two lines down as a bare `expected false to be true` against
+    // the predicate, which is the confusion this premise assertion is here to
+    // prevent.
+    expect(
+      typeof (original as NodeJS.ErrnoException).code,
+      "the predicate reads `code` only when it is a string",
+    ).toBe("string");
+    expect(
+      String((original as NodeJS.ErrnoException).code),
+      "the real vm failure still carries the vm code",
+    ).toMatch(/^ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING/);
+
+    const reworded = new Error("the wording of this error changed upstream");
+    (reworded as NodeJS.ErrnoException).code = (original as NodeJS.ErrnoException).code;
+
+    // `String(reworded)`, which is what the predicate inspects -- not
+    // `.message`, which is what an earlier version checked. They differ by the
+    // error's name prefix, so a fixture that ever carried the phrase in its
+    // NAME would satisfy the message clause while this assertion still passed,
+    // and this test would go green without the code clause -- silently
+    // reopening the gap it exists to close.
+    expect(String(reworded)).not.toMatch(/dynamic import callback/i);
+    expect(isVmDynamicImportUnavailable(reworded)).toBe(true);
   });
 
   it("does not throw when the error carries a NUMERIC code", async () => {
