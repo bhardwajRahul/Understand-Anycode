@@ -8,12 +8,26 @@ live here so they do not have to be kept consistent across three source files.
 Origin: Ix#598 (the fix) and Ix#650 (this correction). Windows / Node 26,
 against a live backend.
 
-The harness and real-ingest arms are from the pre-fix build `084f472` --
-necessarily, since they need the `terminate()` teardown that #598 removed. The
-vitest consistency check below is NOT: it needs the current tree, and its
-"36 of 38" is today's file count. At `084f472` the suite was smaller, so
-anyone reproducing that arm by checking out `084f472` will count differently
-and should redo the arithmetic with what they find.
+**Reproducing these arms, precisely, because no single commit runs them
+all.** They need the `terminate()` teardown that #598 removed, and the fix
+landed BEFORE the test file the real-ingest arm drives:
+
+| commit | | |
+|---|---|---|
+| `084f472` | #570 | last build with the `terminate()` teardown |
+| `20e1dae` | #598 | the fix -- teardown becomes `__shutdown` + `unref()` |
+| `b9b84ef` | #597 | adds `ingest-files.test.ts` |
+
+So:
+
+- The **minimal harness** arm runs at `084f472`.
+- The **real-ingest** arm needs both, and no commit has both -- checked every
+  commit on `main`. It was measured on a hand-assembled tree: `b9b84ef`'s
+  `ingest-files.test.ts` over `084f472`'s `parse-pool.ts`. An earlier revision
+  of this file said "check out `084f472`", which gives "no such file". Say the
+  recipe or the arm is not reproducible.
+- The **vitest** check needs the CURRENT tree, not either of those: its
+  "36 of 38" is today's count.
 
 ## The bug
 
@@ -63,21 +77,30 @@ twenty-teardown arm's own rate (5.5%, again per pool):
 `P(≥5 of 40 | p=0.055) = 0.067` — a failure to reject, borderline, not a
 demonstration of agreement.
 
-**Real ingests** — `ingest-files.test.ts` under vitest, ~9.5 ingests per
-process at the time of measuring (it drives 14 today):
+**Real ingests** — `ingest-files.test.ts` under vitest. That file drives a
+FIXED number of ingests per process, not an average: **12** at `b9b84ef`, the
+version measured (14 today). The per-teardown rate is `1-(1-p)^12` solved
+against the process counts:
 
 | configuration | result | per POOL teardown |
 |---|---|---|
-| idle machine | 2 of 75 processes | 0.28% |
-| loaded machine | 9 of 50 processes | 2.1% |
+| idle machine | 2 of 75 processes | 0.225% |
+| loaded machine | 9 of 50 processes | 1.64% |
 
-(Per pool, as everywhere else here — not per isolate. 0.28% sits next to the
+(Per pool, as everywhere else here — not per isolate. 0.225% sits near the
 0.31% per-ISOLATE hazard derived below, and they are not the same quantity.)
 
-Fisher exact on 2/75 vs 9/50 is **p = 0.007** two-sided (0.004 one-sided), so
-load matters. A real `ix ingest` of 300 files was **0 of 60** — that is *one*
-teardown per process, and `P(zero in 60)` is 0.84 at the idle rate, 0.29 at the
-loaded one. Unremarkable under either.
+Earlier revisions divided by **9.5**, giving 0.28% and 2.1%. That number is
+not derivable from any version of the file and no derivation was ever
+recorded, so it is withdrawn. It was not harmless: it sets the headline ratio
+below, and 9.5 is the flattering end — the correction moves the harness
+overstatement from 22× to 28×, i.e. further from the harness, not nearer.
+
+Fisher exact on 2/75 vs 9/50 is **p = 0.007** two-sided (0.004 one-sided), and
+is unaffected by the divisor since it compares process counts. A real
+`ix ingest` of 300 files was **0 of 60** — that is *one* teardown per process,
+and `P(zero in 60)` is 0.87 at the idle rate, 0.37 at the loaded one.
+Unremarkable under either.
 
 ## The grammar tally
 
@@ -100,20 +123,21 @@ writing down.
 
 ## What this does and does not establish
 
-The minimal harness overstates real exposure by **22×** on the only
+The minimal harness overstates real exposure by **28×** on the only
 load-matched comparison available (idle vs idle). Against the loaded real rate
-it is 3.1×, but that mixes conditions — the harness was never run loaded, and
-load raises the rate — so treat 3.1× as a lower bound on what is unexplained,
+it is 3.9×, but that mixes conditions — the harness was never run loaded, and
+load raises the rate — so treat 3.9× as a lower bound on what is unexplained,
 not the residue after subtracting load.
 
 **Parses per worker is not controlled.** `ingestFiles` parses a `.ts` file
 twice (index prescan, then streaming loop, both on the same pool), so file
 counts double; and `ingest-files.test.ts` is not uniformly 30 files — it calls
-`fixture(30)` eight times, `fixture(12)` once and `fixture(4)` twice, giving
-0.38 to 2.9 parses per worker across its runs and straddling the harness's
-~1.4. An earlier claim that "the harness parses the least per worker and
-crashes the most" is therefore false for several of the teardowns behind the
-data. This remains an open confound.
+`fixture(30)` **seven** times, `fixture(12)` once and `fixture(4)` twice at
+`b9b84ef` — the measured version; it is eight/one/two today — giving 0.38 to
+2.9 parses per worker across its runs and straddling the harness's ~1.4.
+An earlier claim that "the harness parses the least per worker and crashes the
+most" is therefore false for several of the teardowns behind the data. This
+remains an open confound.
 
 **The addon is held from module evaluation, not from the first parse.**
 `core-ingestion/src/index.ts` resolves grammars at module scope and
@@ -134,8 +158,8 @@ an undispatched worker is **not known to be safe to terminate**. Workers that
 had parsed were the ones observed to crash, and a spawn-then-destroy arm went
 0 of 120 teardowns. **Do not use that arm.** Its harness calls `pool.init()`
 and then `await pool.destroy()` with nothing in between — no wait for an ack
-or an `'online'` event — so it tore the workers down inside the addon-free
-window
+or an `'online'` event. The inference is that it therefore tore the workers
+down inside the addon-free window
 described above. It measured threads that had not finished loading, which is a
 different population from "evaluated but never dispatched", and it therefore
 says nothing about whether parsing matters. Earlier revisions of this document
@@ -179,19 +203,26 @@ those disposals as independent gives `1-(1-h)^21 = 0.063`, i.e. **h = 0.31%**
 — a factor of 20.5, and for a pool of 21 that is the only shape the answer can
 take: at small h the pool rate is about 21h, so the ratio can approach 21 and
 never exceed it. Any conversion factor larger than the pool size is arithmetic
-that went wrong, which is how the ~28× an earlier revision quoted here was
-caught (it was 8.6% over 0.31% — a single arm's per-pool rate against the
-pooled per-isolate one).
+that went wrong, which is how a bad conversion factor quoted here in an
+earlier revision was caught: it divided 8.6% by 0.31%, a single arm's per-pool
+rate against the pooled per-isolate one, and got 27.7. Written out because it
+rounds to 28 and so does the harness-overstatement figure above, which is
+correct and unrelated (6.3% over 0.225%). Two different quantities landing on
+the same rounded number, one of them retracted, is exactly the confusion this
+file exists to prevent.
 
 **Independence is an assumption, and this document has direct evidence
 against it.** The idle-vs-loaded real-ingest rates differ 7× at identical pool
-size, and the harness overstates idle real ingests by 22×, so something not in
+size, and the harness overstates idle real ingests by 28×, so something not in
 the model moves the rate. Carrying `h` from the harness onto vitest's
 one-at-a-time terminations is also a cross-population transfer — the same move
 this file retracts for the "one in twelve" figure. The conclusion survives
 either way, which is why it is stated rather than hedged away: redo it with
-the real-ingest IDLE hazard instead and `P(0 in 10 runs)` is about 0.95
-against 0.33, both unremarkable. Nothing here rests on the exact h.
+the real-ingest IDLE hazard instead — 0.225% per pool over 21 isolates is
+h = 1.07e-4, and 36 terminated isolates over 10 runs gives **0.96** — against
+0.33, both unremarkable. Nothing here rests on the exact h. (An earlier
+revision said 0.95; the stated inputs give 0.962, and every other figure in
+this file reproduces to the digit.)
 
 How many addon-loaded isolates a run terminates is not a guess: `isolate`
 defaults to `true`, `core-ingestion` ships no vitest config to change it, and

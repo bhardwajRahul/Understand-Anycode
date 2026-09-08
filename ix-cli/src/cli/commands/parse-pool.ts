@@ -189,8 +189,8 @@ export class ParsePool {
    *
    * DO NOT add a `terminate()` fast path for workers that have never been
    * dispatched. They hold the addon too: `core-ingestion/src/index.ts`
-   * resolves grammars at module scope, and `tree-sitter` plus the twelve
-   * static grammars sit near the top of its dependency graph -- so a worker
+   * resolves grammars at module scope, and `tree-sitter` plus the statically
+   * imported grammars sit near the top of its dependency graph -- so a worker
    * holds them within moments of `new Worker()`, without ever being
    * dispatched, and long before `index.ts`'s own body or its top-level
    * `await`s run. Note which end that pins: the addon-free window CLOSES when
@@ -198,18 +198,31 @@ export class ParsePool {
    * suspended at one of those awaits already holds all twelve, and is not
    * safe to terminate.
    *
-   * Not every grammar -- 15 of the 27 go through null-returning helpers and
-   * can be absent -- but the core and the twelve static ones are always
-   * there, which is the PRECONDITION the crash needs. Whether it is also
+   * Not every grammar: most go through null-returning helpers and can be
+   * absent, but the core and the statically imported ones are always there,
+   * which is the PRECONDITION the crash needs. Counts in
+   * `docs/parse-pool-teardown.md` rather than here -- the same reason the
+   * rates live there, and #595 is the worked example of what restating them
+   * costs: it added a required grammar and left a tally in
+   * `core-ingestion/src/index.ts` stale, with nothing red. Whether it is also
    * sufficient has never been measured: the one experiment that looked --
    * spawn-then-destroy, 0 of 120 -- destroyed its pool with no wait for an
-   * ack or an `'online'` event, so it tore threads down inside that window,
-   * before they had finished loading. Different population; it says nothing
-   * about undispatched workers. This is the file where a fast path would be
-   * written, which is why the warning is here and not only in the tests.
+   * ack or an `'online'` event. So it very probably tore threads down inside
+   * that window, before they had finished loading -- a different population,
+   * saying nothing about undispatched workers. Probably, not certainly: that
+   * is an inference from the teardown code, not a measurement, and it is the
+   * sole reason for discarding the only evidence AGAINST this rule.
+   *
+   * This is the file where a fast path would be written, which is why the
+   * warning is here and not only in the tests.
    *
    * The comparison that settles the verb, on Windows/Node 26, twenty pool
-   * teardowns per process, six runs each:
+   * teardowns per process, six runs each. It settles WHICH VERB, and that is
+   * all: do not derive a rate from it. Read alone the first row implies 8.6%
+   * per pool teardown, which is close to the "one in twelve" this whole
+   * change exists to retract -- it is one of three arms, and the pooled fit
+   * over all of them is in `docs/parse-pool-teardown.md`. Quoting a single
+   * arm is how the retracted figure got published the first time.
    *
    *   terminate()                        5 of 6 runs died with SIGSEGV (139)
    *   worker closes its own port         0 of 6
@@ -431,7 +444,14 @@ export class ParsePool {
   }
 
   /**
-   * Replacement workers spawned over the whole run. Monotonic.
+   * Worker deaths this run has reacted to. Monotonic.
+   *
+   * Deaths, not replacements: past `MAX_RESPAWNS` the pool stops replacing but
+   * still reacts -- splicing `idle`, latching `dead`, draining the queue -- and
+   * a caller watching for "did the pool notice a worker die" needs those too.
+   * An earlier revision counted replacements and sat inside the cap branch,
+   * which silently stopped advancing at exactly the point a caller most wants
+   * to know.
    *
    * Deliberately NOT `respawns`, which is a budget rather than a tally:
    * `onResult` clears it on every successful round trip, so a run that lost a
@@ -440,12 +460,12 @@ export class ParsePool {
    * is the right behaviour for the cap and the wrong number for a reader, and
    * it makes `respawns` useless to wait on: any completed parse resets it.
    *
-   * This one is a LEVEL. `onError` increments it and pushes the replacement in
-   * the same synchronous handler, so once it is non-zero the pool has finished
-   * reacting to a worker death -- including one that faulted with no task in
-   * flight, which `crashedTasks()` deliberately does not count because no file
-   * was lost. That combination is otherwise unobservable from outside, which
-   * is what this exists for.
+   * This one is a LEVEL. `onError` increments it in the same synchronous
+   * handler that does the splicing, so once it has advanced the pool has
+   * finished reacting to that death -- including one that faulted with no task
+   * in flight, which `crashedTasks()` deliberately does not count because no
+   * file was lost. That combination is otherwise unobservable from outside,
+   * which is what this exists for.
    *
    * Test observability, and only that today -- nothing in `ingest.ts` reads
    * it, so a run that respawned a dozen workers still prints the same summary
@@ -456,11 +476,11 @@ export class ParsePool {
    * latches for the life of the run, so `> 0` answers "has any worker ever
    * died", which is true forever after the first one -- correct only for a
    * test observing that first death. Anything later wants
-   * `const before = pool.respawnCount()` and then `> before`, or it is a
+   * `const before = pool.workerDeaths()` and then `> before`, or it is a
    * poll that returns immediately and waits for nothing.
    */
-  respawnCount(): number {
-    return this.respawnsTotal;
+  workerDeaths(): number {
+    return this.deaths;
   }
 
   private onResult(w: Worker, msg: { ok: boolean; result: unknown }): void {
@@ -488,12 +508,12 @@ export class ParsePool {
    * `MAX_RESPAWNS` -- so 0 means the full budget is available and 16 means it
    * is exhausted, which is the opposite of how "budget" usually reads.
    * `onResult` clears it on any success, so it is not a tally either: read
-   * `respawnsTotal` for "how many did this run spawn?".
+   * `deaths` for "how many workers died this run?".
    */
   private respawns = 0;
 
-  /** Every replacement this run has spawned. Never reset. */
-  private respawnsTotal = 0;
+  /** Worker deaths this run has reacted to. Never reset. */
+  private deaths = 0;
 
   /**
    * True once the pool is out of workers AND out of replacements.
@@ -551,9 +571,16 @@ export class ParsePool {
     const idleIdx = this.idle.indexOf(w);
     if (idleIdx !== -1) this.idle.splice(idleIdx, 1);
 
+    // Before the cap branch, because a capped death still reacts fully --
+    // it splices `idle`, latches `dead` and drains the queue -- and a signal
+    // that means "the pool has finished reacting" has to advance for those
+    // too. Inside the branch it counted replacements instead, so past the cap
+    // it stopped moving and the `> before` wait below would hang on exactly
+    // the deaths a caller most wants to observe.
+    this.deaths++;
+
     if (this.respawns < ParsePool.MAX_RESPAWNS) {
       this.respawns++;
-      this.respawnsTotal++;
       this.spawnWorker();
     } else if (this.workers.length === 0) {
       // Out of workers and out of replacements. Nothing queued can ever be

@@ -25,9 +25,10 @@ if (!parentPort) throw new Error('parse-worker must run inside a worker thread')
  * NEVER-DISPATCHED WORKERS ARE NOT EXEMPT. The addon is held from module
  * EVALUATION, not from the first parse: `index.ts` resolves its grammars at
  * module scope and this file imports it statically, so a worker reaches that
- * state on its own without being dispatched. `tree-sitter` and the twelve
- * grammars are `index.ts`'s own static imports, near the top of its dependency
- * graph, so the isolate holds them within moments of `new Worker()` -- long
+ * state on its own without being dispatched. `tree-sitter` and the statically
+ * imported grammars are `index.ts`'s own imports, near the top of its
+ * dependency graph, so the isolate holds them within moments of
+ * `new Worker()` -- long
  * before that file's body or its top-level `await`s run. A worker that has
  * parsed nothing, or that is still suspended at one of those awaits, holds
  * them all the same. That is the precondition the crash needs, so an
@@ -35,8 +36,9 @@ if (!parentPort) throw new Error('parse-worker must run inside a worker thread')
  *
  * Whether it is as dangerous as a parsed one has never been measured: the one
  * arm that looked -- spawn-then-destroy, 0 of 120 -- destroyed its pool with
- * no wait for an ack or an `'online'` event, so it tore threads down before
- * they had finished loading: a different population.
+ * no wait for an ack or an `'online'` event, so it very probably tore threads
+ * down before they had finished loading: a different population. Inferred
+ * from that teardown code, not measured.
  *
  * `parse-pool.test.ts` used to say the opposite -- "an untouched worker has
  * not loaded the addon" -- which is what made a `terminate()` fast path for
