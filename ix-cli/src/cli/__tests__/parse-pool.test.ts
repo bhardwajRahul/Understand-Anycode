@@ -169,15 +169,50 @@ describe("ParsePool", () => {
     // hang. `Worker.terminate()` tears a thread down from outside, and doing
     // that to one that has loaded the tree-sitter native bindings segfaults the
     // PROCESS -- an idle worker that parsed a single file is enough, because
-    // the crash is in disposing an isolate that still holds the addon. Twenty
-    // teardowns per process, six runs each, on Windows/Node 26:
+    // the crash is in disposing an isolate that still holds the addon. The
+    // comparison that settles it is on `ParsePool.shutdown` in
+    // `../commands/parse-pool.ts`; rates and populations are in
+    // `docs/parse-pool-teardown.md`, not restated here. What matters
+    // for this file: a pool built on one of the inline `.mjs` fixtures never
+    // imports `core-ingestion`, so its teardown cannot crash, and only a pool
+    // pointed at the real built worker can. Stated as a property of the
+    // fixture rather than as "only the test at the bottom", which is true
+    // today and goes stale silently the first time a second real-worker test
+    // is added -- and goes stale in the dangerous direction, telling whoever
+    // added it that their teardown cannot crash. Deliberately no tally
+    // either, for the same reason: a count goes stale with the suite green.
     //
-    //   terminate()                    5 of 6 runs died with SIGSEGV (139)
-    //   worker closes its own port     0 of 6
+    // And on the shipped build nothing here calls `terminate()` at all --
+    // Ix#598 removed it. A worker that will not
+    // answer `__shutdown` is left alive and `unref()`'d, and process exit
+    // does NOT run the shutdown path that `terminate()` drives. Probed three
+    // times, in a standalone script rather than through this pool: the parent
+    // never receives an 'exit' event for such a worker, and the worker's own
+    // `process.on('exit')` never runs -- the process leaves at code 0 with the
+    // thread still live.
     //
-    // `destroy()` runs in `ingestFiles`'s outermost `finally`, so this was one
-    // `ix map` in roughly twelve exiting 139 with every patch committed and the
-    // summary printed -- which is why nobody reported it.
+    // Standalone matters. The give-up path calls `removeAllListeners('exit')`
+    // before it unrefs, so measured through `ParsePool` the missing event
+    // would be guaranteed by construction and would show nothing. It is the
+    // worker-side handler that carries this.
+    //
+    // The give-up branch of `shutdown` in `../commands/parse-pool.ts` says the
+    // same thing -- "nobody disposes an isolate that still holds the addon" --
+    // though that is in the branch body, not in `shutdown`'s doc header, which
+    // only covers how long a wedged worker survives. An earlier revision of
+    // THIS comment said the opposite ("its isolate is still disposed when the
+    // process exits"), which would have told a reader the give-up path is
+    // exposed to the crash. It was the one claim in this PR that two files
+    // answered differently.
+    //
+    // The arm behind it is weak on its own -- four addon-loaded threads
+    // unref'd across exit, 0 failures in 10 runs, which at the per-isolate
+    // hazard is the expected result either way -- so the mechanism is what
+    // carries it, not the count.
+    //
+    // Nor is the repo clear: `core-ingestion`'s own suite runs on vitest's
+    // threads pool, which does terminate threads that have loaded the addon.
+    // The doc covers both.
     //
     // Asserted through a marker the worker writes when ASKED to go, because the
     // crash itself is probabilistic: a test that just tore pools down would
@@ -201,8 +236,12 @@ describe("ParsePool", () => {
 
     const pool = new ParsePool(path, 2);
     pool.init();
-    // Parse first: an untouched worker has not loaded the addon, and it is the
-    // loaded-then-idle thread that crashes.
+    // Parse first so the worker is idle-after-work, which is the state
+    // `destroy()` meets in a real run. Note this fixture is an inline .mjs that
+    // never imports `core-ingestion`, so no addon is loaded here and the crash
+    // itself cannot occur -- what is pinned is the MECHANISM, that the pool
+    // asks rather than terminates. The real-worker test lower down is the one
+    // that runs against the addon.
     await Promise.all([pool.parse("a.ts", "x"), pool.parse("b.ts", "x")]);
     await pool.destroy();
 
@@ -263,7 +302,8 @@ describe("ParsePool", () => {
     const pool = new ParsePool(path, 1, 100);
     pool.init();
     const parsing = pool.parse("slow.ts", "x");
-    // Destroy while it is mid-parse, so the first expiry lands on a BUSY worker.
+    // Destroy while it is mid-parse, so the first expiry lands on a BUSY
+    // worker.
     await new Promise(resolve => setTimeout(resolve, 50));
 
     const started = Date.now();
@@ -281,9 +321,9 @@ describe("ParsePool", () => {
     // and only then does the worker reach the queued `__shutdown` and start
     // unwinding its isolate. An expiry landing in that window sees a worker
     // that looks idle and unresponsive and abandons it -- one that was about to
-    // answer. Under the old `terminate()` this was the ~8% per-teardown
-    // segfault itself; the pool unrefs now, so the cost is a lost parse result
-    // rather than the process, and it is still wrong.
+    // answer. Under the old `terminate()` this was the segfault itself; the
+    // pool unrefs now, so the cost is a lost parse result rather than the
+    // process, and it is still wrong.
     //
     // The timings are chosen so the two rules give different answers, which is
     // the only way to catch this. Grace 300ms, so ticks land at 300/600/900. A
@@ -538,9 +578,23 @@ describe("ParsePool", () => {
     // bound by a factor of three, on any runner.
     const pool = new ParsePool(real, 2, 10000);
     pool.init();
-    // Parse for real, so the threads have the tree-sitter addon loaded -- an
-    // untouched worker does not, and it is the loaded-then-idle thread that
-    // crashes under `terminate()`.
+    // Parse for real, because having PARSED is what was observed to arm the
+    // crash. Not because parsing loads the addon: `index.ts` resolves
+    // 27 grammars plus the core at module scope -- twelve by static import, the
+    // rest eagerly through helpers -- so these threads hold the core and the
+    // twelve within moments of spawn, well before that module finishes
+    // evaluating. The other 15 resolve through null-returning helpers and are
+    // absent wherever a platform has no prebuild, so the guaranteed floor is
+    // the core plus the statically imported twelve -- which is all this test
+    // needs. (One of the 15, `tree-sitter-powershell`, is a required
+    // dependency that loads through a helper anyway.) The exact tally is in
+    // `docs/parse-pool-teardown.md` rather than here.
+    //
+    // Workers that had parsed were the ones observed to crash under
+    // `terminate()`, and spawn-then-destroy was not -- but the mechanism was
+    // never isolated, and the addon is held either way, so that does not
+    // establish an undispatched worker is safe to terminate. Parse here
+    // because the real run does.
     const results = await Promise.all([
       pool.parse("a.ts", "export function a(): number { return 1; }"),
       pool.parse("b.ts", "export function b(): number { return 2; }"),

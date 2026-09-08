@@ -185,16 +185,42 @@ export class ParsePool {
    * that has loaded the tree-sitter native bindings segfaults the process. The
    * thread does not have to be busy: an idle worker that has parsed a single
    * file is enough, because the crash is in disposing an isolate that still
-   * holds the addon. Measured on Windows/Node 26, twenty pool teardowns per
-   * process, six runs each:
+   * holds the addon.
+   *
+   * DO NOT add a `terminate()` fast path for workers that have never been
+   * dispatched. They hold the addon too: `core-ingestion/src/index.ts`
+   * resolves grammars at module scope, and `tree-sitter` plus the twelve
+   * static grammars sit near the top of its dependency graph -- so a worker
+   * holds them within moments of `new Worker()`, without ever being
+   * dispatched, and long before `index.ts`'s own body or its top-level
+   * `await`s run. Note which end that pins: the addon-free window CLOSES when
+   * those static imports evaluate, not when evaluation finishes. A worker
+   * suspended at one of those awaits already holds all twelve, and is not
+   * safe to terminate.
+   *
+   * Not every grammar -- 15 of the 27 go through null-returning helpers and
+   * can be absent -- but the core and the twelve static ones are always
+   * there, which is the PRECONDITION the crash needs. Whether it is also
+   * sufficient has never been measured: the one experiment that looked --
+   * spawn-then-destroy, 0 of 120 -- destroyed its pool with no wait for an
+   * ack or an `'online'` event, so it tore threads down inside that window,
+   * before they had finished loading. Different population; it says nothing
+   * about undispatched workers. This is the file where a fast path would be
+   * written, which is why the warning is here and not only in the tests.
+   *
+   * The comparison that settles the verb, on Windows/Node 26, twenty pool
+   * teardowns per process, six runs each:
    *
    *   terminate()                        5 of 6 runs died with SIGSEGV (139)
    *   worker closes its own port         0 of 6
    *   worker calls process.exit(0)       0 of 6
    *
-   * `destroy()` runs in `ingestFiles`'s outermost `finally`, so this was one
-   * `ix map` in roughly twelve exiting 139 with every patch committed and the
-   * summary already printed -- invisible unless something reads the status.
+   * Per-consumer rates, the populations behind them and the statistics are in
+   * `docs/parse-pool-teardown.md` -- versioned, and not this file's history,
+   * which still carries #598's retracted figures and, in the squashed body,
+   * every superseded value next to its correction. They do not change the
+   * rule, and keeping them consistent across three files proved to be its own
+   * source of errors.
    *
    * What the grace period bounds, precisely: the wait for a reply from a
    * worker that is IDLE and does not answer -- one whose JS event loop is
@@ -207,15 +233,20 @@ export class ParsePool {
    * rule had a counterexample, because `terminate()` is simply the wrong verb
    * for teardown. It is what segfaults. Against a worker inside a native call
    * it does not even preempt: V8's termination interrupt is only checked at JS
-   * boundaries, so it resolves when the call returns on its own (3981ms
-   * against ~4s of CPU-bound native work, measured), making it slower AND
-   * crash-prone there. Only a JS-wedged worker dies promptly, in about 2ms.
+   * boundaries, so it resolves only when the call returns on its own --
+   * measured twice against ~4-4.5s of CPU-bound native work, at 3981ms and
+   * 4457ms (two runs of the same experiment, not a discrepancy) -- making it
+   * slower AND crash-prone there. Only a JS-wedged worker dies promptly, in
+   * about 2ms.
    *
    * Teardown does not need the thread to die. It needs the pool to stop
    * waiting on it and the thread to stop holding the process open, which is
    * exactly `unref()`. Measured on the real parse worker, four addon-loaded
-   * threads left live and unref'd across process exit: 0 failures in 10 runs,
-   * against 5 of 6 for `terminate()`.
+   * threads left live and unref'd across process exit: 0 failures in 10 runs
+   * -- though that arm is four isolates in one teardown, against a table of
+   * twenty teardowns of a 21-worker pool, so it carries little on its own.
+   * `docs/parse-pool-teardown.md` has the section, including why 0 of 10 has
+   * no power here.
    *
    * So the clocks below decide WHEN to give up, never whether it is safe to
    * kill -- and the `onError` path needs no special case either, which is what
@@ -308,13 +339,14 @@ export class ParsePool {
         // `terminate()` was the wrong verb for this whole branch. It is what
         // segfaults -- that is the bug this file exists to fix -- and against a
         // worker inside a native call it does not even preempt: it resolves
-        // when the call returns (4457ms against ~4.5s of work, measured), so it
-        // was strictly slower AND crash-prone there. `unref()` gives the only
-        // thing teardown actually needs: the thread stops keeping the event
-        // loop alive, so the CLI exits, and nobody disposes an isolate that
-        // still holds the addon. Measured on the real parse worker, four
+        // only when the call returns, so it was strictly slower AND
+        // crash-prone there (the timings are on `shutdown` above). `unref()`
+        // gives the only thing teardown needs: the thread stops keeping the
+        // event loop alive, so the CLI exits, and nobody disposes an isolate
+        // that still holds the addon. Measured on the real parse worker, four
         // addon-loaded threads left live and unref'd across process exit: 0
-        // failures in 10 runs, against 5 of 6 for `terminate()`.
+        // failures in 10 runs. Note that is one teardown per run, so it is
+        // not comparable to `shutdown`'s twenty-teardown table.
         //
         // The cost is written up on `shutdown` above: a wedged worker survives
         // until the process exits. Nothing for the CLI, and `ix watch` runs
