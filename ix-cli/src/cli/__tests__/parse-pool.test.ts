@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -72,16 +72,111 @@ describe("ParsePool", () => {
     process.exit(1);
   `;
 
-  /** Answers its first message, then faults while IDLE. */
-  const IDLE_FAULT = `
-    import { parentPort } from 'node:worker_threads';
-    let served = 0;
+  /**
+   * Faults ONCE per pool, not once per worker.
+   *
+   * `let served = 0` was per-thread, so the replacement armed its own fault
+   * shortly after serving `a2.ts` -- and `b2.ts` is only posted once the
+   * parent has received a2's result and re-drained. Miss that window on a
+   * busy machine and the replacement dies with `b2.ts` in flight, which
+   * `onError`
+   * resolves to null: the exact Ix#567 signature, from the harness rather
+   * than the pool. Fixing only the first wait would have left this half of
+   * the race in place.
+   *
+   * The marker is a file because the arming has to be visible to the NEXT
+   * thread, and these fixtures share nothing else.
+   */
+  const IDLE_FAULT_ONCE = (marker: string): string => `
+    import { parentPort, threadId } from 'node:worker_threads';
+    import { writeFileSync } from 'node:fs';
+    const marker = ${JSON.stringify(marker)};
+
+    // Claim at MODULE SCOPE, once per thread, before any message is
+    // served. The previous revision claimed inside the message handler,
+    // which put a filesystem write on the path of every parse: the
+    // replacement re-attempted it while serving \`b2.ts\`, and a transient
+    // EPERM there faulted a worker with a task in flight -- producing
+    // \`b2.ts -> null\`, which is the Ix#567 signature this whole test exists
+    // to tell apart from a harness problem. The old fixture did no I/O at
+    // all, so that was exposure this PR introduced. Here the write happens
+    // once, before the pool can dispatch anything, and the handler touches
+    // no filesystem at all.
+    //
+    // \`wx\` because it is one atomic syscall: \`existsSync\` then write is two,
+    // and two threads can both pass the check. That cannot happen at this
+    // pool's concurrency of 1, but the guarantee is stated
+    // unconditionally, and this is what makes it true at any size.
+    let isFaulter = false;
+    try {
+      writeFileSync(marker, threadId + '\\n', { flag: 'wx' });
+      isFaulter = true;
+    } catch (err) {
+      // EEXIST is the expected answer: another thread holds the claim.
+      // Anything else means THIS thread failed to claim for an unrelated
+      // reason, and if it was the first thread the next one claims
+      // successfully and the run looks entirely normal -- one arming, one
+      // respawn, green. A previous revision rethrew here and claimed that
+      // surfaced the problem; it does not, it just moves which thread
+      // faults. So record it instead, and let the test assert the absence
+      // of this file. Best-effort: if this write fails too there is
+      // nothing left to say with.
+      if (err.code !== 'EEXIST') {
+        try {
+          writeFileSync(marker + '.failed', threadId + ' ' + err.code + '\\n', { flag: 'a' });
+        } catch {}
+      }
+    }
+
+    let armed = false;
     parentPort.on('message', (msg) => {
       if (msg && msg.__shutdown) { parentPort.close(); return; }
       parentPort.postMessage({ ok: true, result: { filePath: msg.filePath } });
-      if (++served === 1) setTimeout(() => { throw new Error('idle fault'); }, 20);
+      // The delay exists so the parent has consumed this reply before the
+      // fault lands: 'message' and 'error' reach it on different channels,
+      // so a parent descheduled across both can process the 'error' first,
+      // find the task still in \`active\`, and resolve it null -- failing the
+      // first.ts assertion with the very signature this test is meant to
+      // distinguish. It was 20ms, the same order as the scheduling delays
+      // that caused the original flake; it is 250ms now.
+      //
+      // What this does NOT do is remove the ordering dependency, and it
+      // cannot: the worker has no way to learn that its reply was consumed,
+      // and a fault raised while a task IS in flight never leaves a stale
+      // entry in \`idle\`, which is the whole bug. So the premise needs an
+      // idle fault, an idle fault needs a delay, and this only makes the
+      // required parent stall implausible rather than merely unlikely.
+      if (isFaulter && !armed) {
+        armed = true;
+        setTimeout(() => { throw new Error('idle fault'); }, 250);
+      }
     });
   `;
+
+  /**
+   * Poll until `cond` holds. Deliberately not a fixed sleep: every wait in
+   * this file that is really "wait for the pool to observe something" should
+   * be bounded by the observation, so it costs a few ms when idle and still
+   * passes on a runner that is thrashing. The timeout only decides how long
+   * to wait before calling it a failure, so it can be generous.
+   */
+  const waitUntil = async (
+    cond: () => boolean,
+    // A thunk, not just a string, so the message can be built when the wait
+    // FAILS. A caller waiting on something the fixture arranges needs to say
+    // "the fixture never armed" rather than "the pool never reacted", and it
+    // can only tell them apart at that moment.
+    what: string | (() => string),
+    timeoutMs = 10000,
+  ): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!cond()) {
+      if (Date.now() > deadline) {
+        throw new Error(`waitUntil timed out: ${typeof what === "string" ? what : what()}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
 
   it("parses through the pool and shuts down without hanging", async () => {
     const pool = new ParsePool(worker("echo", ECHO), 2);
@@ -121,12 +216,40 @@ describe("ParsePool", () => {
     // tasks -- and it was spliced out of `workers` but left in `idle`, so the
     // next `drain()` popped the terminated thread and posted to nothing: that
     // task's promise never settled.
-    const pool = new ParsePool(worker("idlefault", IDLE_FAULT), 1);
+    const marker = join(dir, "idle-fault-armed");
+    const pool = new ParsePool(worker("idlefault", IDLE_FAULT_ONCE(marker)), 1);
     pool.init();
 
     expect(await pool.parse("first.ts", "x")).toEqual({ filePath: "first.ts" });
-    // Let the fault land while the pool is idle.
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    // Wait for the fault to LAND, not for a duration. The fixture throws
+    // 250ms after serving, and this was `setTimeout(120)` -- ample when the
+    // machine is idle (0 failures in 10 runs) and is not when it is busy: 1 of
+    // 8 runs under saturating CPU load, where the 'error' event had not been
+    // delivered before the two parses below went out. The test then failed on
+    // `b2.ts` coming back null, which looks exactly like the bug it guards.
+    //
+    // `respawnCount()` is the pool's own signal that `onError` ran to
+    // completion, so this waits on the state the test actually depends on and
+    // is done as soon as it holds.
+    // `> 0` is only correct because this is the FIRST death of the run. The
+    // counter is monotonic and never resets, so a second wait written this
+    // way returns immediately -- a silent no-op, which is the same class of
+    // bug this test was fixed for. A later fault must capture a baseline
+    // first: `const before = pool.respawnCount()` then `() => pool
+    // .respawnCount() > before`.
+    await waitUntil(
+      () => pool.respawnCount() > 0,
+      // Ask the fixture first. If its claim failed there is no fault to wait
+      // for, and reporting that the pool never reacted would blame the pool
+      // for a harness problem -- the misdiagnosis this whole test exists to
+      // prevent. At concurrency 1 that is the ONLY worker, so nothing
+      // respawns and this wait is where it surfaces; the `.failed` assertion
+      // below never gets to run.
+      () =>
+        existsSync(`${marker}.failed`)
+          ? `the fixture could not claim the fault: ${readFileSync(`${marker}.failed`, "utf8").trim()}`
+          : "the idle fault never reached the pool",
+    );
 
     // TWO at once, deliberately. `drain()` pops the free list, so a single
     // parse takes the replacement worker that `onError` just pushed and never
@@ -135,6 +258,49 @@ describe("ParsePool", () => {
     // posts to nothing, and never settles.
     const both = await Promise.all([pool.parse("a2.ts", "x"), pool.parse("b2.ts", "x")]);
     expect(both).toEqual([{ filePath: "a2.ts" }, { filePath: "b2.ts" }]);
+    // The once-per-pool contract is ENFORCED by the fixture's `wx` flag, which
+    // makes a second arming impossible rather than detectable. This asserts
+    // that the enforcement is still there and did its job: exactly one thread
+    // armed, so `b2.ts` was never racing a replacement's timer.
+    //
+    // Be precise about what it can and cannot fail on, because two earlier
+    // revisions got this wrong in opposite directions. It fails if the `wx`
+    // claim is weakened to an append, and if the marker mechanism is replaced
+    // by per-thread counting (both verified by mutation, 3 of 3). It does NOT
+    // independently detect "a replacement armed too" -- with `wx` in place
+    // that cannot happen, so adding a redundant per-thread guard leaves this
+    // green, which is correct and not a gap.
+    //
+    // What it replaced was an assertion on `respawnCount()`, which pinned
+    // nothing: the replacement's fault is a 250ms timer and the parses above
+    // take a few ms, so the count still reads 1 either way. Reverting the
+    // fixture passed that one 5 runs out of 5.
+    // Read through `existsSync`, so a marker that was never written fails as
+    // "arm exactly one fault" rather than as a raw ENOENT. `waitUntil` above
+    // only proves SOME respawn happened -- a fixture that died during module
+    // evaluation would satisfy it and never arm -- and the ENOENT would then
+    // point at this line instead of at the contract.
+    // No thread failed to claim for an unrelated reason. Without this, a
+    // first-thread EPERM is invisible: the second thread claims successfully,
+    // arms, and every other assertion here stays green.
+    expect(
+      existsSync(`${marker}.failed`) ? readFileSync(`${marker}.failed`, "utf8") : "",
+      "a worker failed to claim the fault for a reason other than EEXIST",
+    ).toBe("");
+    const armings = (existsSync(marker) ? readFileSync(marker, "utf8") : "")
+      .split("\n")
+      // `.filter(Boolean)`, not `.trim()`: an empty file trims to "" and then
+      // splits to [""], so ZERO armings would satisfy `toHaveLength(1)` and
+      // this check would be inert. Unreachable today only because the fault
+      // demonstrably landed above -- but the obvious future fix for the
+      // ENOENT path is to pre-create the marker, which would walk straight
+      // into it.
+      .filter(Boolean);
+    expect(armings, "the fixture must arm exactly one fault for the whole pool").toHaveLength(1);
+
+    // Kept, but for what it is: a cheap check that no EXTRA fault landed
+    // during the two parses. It is not the guard for the line above.
+    expect(pool.respawnCount(), "no further worker died during the parses").toBe(1);
 
     await pool.destroy();
   });

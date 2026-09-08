@@ -430,6 +430,39 @@ export class ParsePool {
     return this.crashed;
   }
 
+  /**
+   * Replacement workers spawned over the whole run. Monotonic.
+   *
+   * Deliberately NOT `respawns`, which is a budget rather than a tally:
+   * `onResult` clears it on every successful round trip, so a run that lost a
+   * dozen workers -- each replacement then parsing a file -- ends with
+   * `respawns === 0` and is indistinguishable from a run that lost none. That
+   * is the right behaviour for the cap and the wrong number for a reader, and
+   * it makes `respawns` useless to wait on: any completed parse resets it.
+   *
+   * This one is a LEVEL. `onError` increments it and pushes the replacement in
+   * the same synchronous handler, so once it is non-zero the pool has finished
+   * reacting to a worker death -- including one that faulted with no task in
+   * flight, which `crashedTasks()` deliberately does not count because no file
+   * was lost. That combination is otherwise unobservable from outside, which
+   * is what this exists for.
+   *
+   * Test observability, and only that today -- nothing in `ingest.ts` reads
+   * it, so a run that respawned a dozen workers still prints the same summary
+   * as a healthy one. Surfacing it there is a reasonable thing to want and a
+   * different change; do not read this comment as saying it already happens.
+   *
+   * Waiting on it means waiting on a BASELINE, not on `> 0`. The count
+   * latches for the life of the run, so `> 0` answers "has any worker ever
+   * died", which is true forever after the first one -- correct only for a
+   * test observing that first death. Anything later wants
+   * `const before = pool.respawnCount()` and then `> before`, or it is a
+   * poll that returns immediately and waits for nothing.
+   */
+  respawnCount(): number {
+    return this.respawnsTotal;
+  }
+
   private onResult(w: Worker, msg: { ok: boolean; result: unknown }): void {
     const task = this.active.get(w);
     if (!task) return;
@@ -450,8 +483,17 @@ export class ParsePool {
   /** True once `destroy()` has begun, so a deliberate exit is not read as a crash. */
   private destroyed = false;
 
-  /** Replacements spawned for crashed workers. Capped -- see `onError`. */
+  /**
+   * Respawns CONSUMED since the last successful round trip, capped at
+   * `MAX_RESPAWNS` -- so 0 means the full budget is available and 16 means it
+   * is exhausted, which is the opposite of how "budget" usually reads.
+   * `onResult` clears it on any success, so it is not a tally either: read
+   * `respawnsTotal` for "how many did this run spawn?".
+   */
   private respawns = 0;
+
+  /** Every replacement this run has spawned. Never reset. */
+  private respawnsTotal = 0;
 
   /**
    * True once the pool is out of workers AND out of replacements.
@@ -511,6 +553,7 @@ export class ParsePool {
 
     if (this.respawns < ParsePool.MAX_RESPAWNS) {
       this.respawns++;
+      this.respawnsTotal++;
       this.spawnWorker();
     } else if (this.workers.length === 0) {
       // Out of workers and out of replacements. Nothing queued can ever be
