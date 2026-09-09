@@ -195,8 +195,8 @@ export class ParsePool {
    * dispatched, and long before `index.ts`'s own body or its top-level
    * `await`s run. Note which end that pins: the addon-free window CLOSES when
    * those static imports evaluate, not when evaluation finishes. A worker
-   * suspended at one of those awaits already holds all twelve, and is not
-   * safe to terminate.
+   * suspended at one of those awaits already holds every one of them, and is
+   * not safe to terminate.
    *
    * Not every grammar: most go through null-returning helpers and can be
    * absent, but the core and the statically imported ones are always there,
@@ -447,8 +447,12 @@ export class ParsePool {
    * Worker deaths this run has reacted to. Monotonic.
    *
    * Deaths, not replacements: past `MAX_RESPAWNS` the pool stops replacing but
-   * still reacts -- splicing `idle`, latching `dead`, draining the queue -- and
-   * a caller watching for "did the pool notice a worker die" needs those too.
+   * still reacts -- it has spliced `workers` before the branch is reached, and
+   * `idle` too if the worker was idle (one that died mid-task lives in
+   * `active`, so there is nothing to take out of the free list -- which is the
+   * case the cap test exercises) -- and a caller watching for "did the pool notice a worker die"
+   * needs those too. (What the branch itself does past the cap depends on
+   * whether any worker survives; `onError` spells that out.)
    * An earlier revision counted replacements and sat inside the cap branch,
    * which silently stopped advancing at exactly the point a caller most wants
    * to know.
@@ -462,9 +466,19 @@ export class ParsePool {
    *
    * This one is a LEVEL. `onError` increments it in the same synchronous
    * handler that does the splicing, so once it has advanced the pool has
-   * finished reacting to that death -- including one that faulted with no task
-   * in flight, which `crashedTasks()` deliberately does not count because no
-   * file was lost. That combination is otherwise unobservable from outside,
+   * BEGUN reacting to that death -- and, since the handler runs to completion
+   * before any asynchronous observer gets the loop back, has finished by the
+   * time anyone polling can read it. The distinction matters only to a future
+   * caller reading this from inside a synchronous path. The increment now runs
+   * before everything the handler does afterwards: on the capped path before
+   * `dead` is latched and before the queue is stranded and resolved, and on
+   * the healthy path before `spawnWorker()` and `drain()`. So such a caller
+   * could see it advanced with `idle` still empty, no replacement yet, and
+   * the queue not yet moving.
+   *
+   * What it observes that nothing else does is a death with no task in
+   * flight, which `crashedTasks()` deliberately does not count because no
+   * file was lost. That combination is otherwise invisible from outside,
    * which is what this exists for.
    *
    * Test observability, and only that today -- nothing in `ingest.ts` reads
@@ -478,6 +492,20 @@ export class ParsePool {
    * test observing that first death. Anything later wants
    * `const before = pool.workerDeaths()` and then `> before`, or it is a
    * poll that returns immediately and waits for nothing.
+   *
+   * Two things stop it moving, and a `> before` wait across either never
+   * completes -- the same hang this counter was moved out of the cap branch
+   * to avoid, one step further along:
+   *
+   *   teardown   `onError` returns at its `destroyed` guard, so no death is
+   *              counted once `destroy()` has begun.
+   *   the latch  past `MAX_RESPAWNS` with no worker left, `dead` is set and
+   *              nothing is ever spawned again, so no further death can
+   *              occur. This one bites while the process is still running
+   *              normally, which makes it the easier of the two to miss.
+   *
+   * The teardown caveat is on the private `respawns` field too, which a
+   * caller reading this accessor would not see.
    */
   workerDeaths(): number {
     return this.deaths;
@@ -508,7 +536,10 @@ export class ParsePool {
    * `MAX_RESPAWNS` -- so 0 means the full budget is available and 16 means it
    * is exhausted, which is the opposite of how "budget" usually reads.
    * `onResult` clears it on any success, so it is not a tally either: read
-   * `deaths` for "how many workers died this run?".
+   * `deaths` for "how many deaths did the pool REACT to?" -- which is not the
+   * same as "how many workers died": `onError` returns early once `destroy()`
+   * has begun, so the ordinary end-of-run exit of every surviving worker is
+   * uncounted, and a clean run ends at 0.
    */
   private respawns = 0;
 
@@ -523,8 +554,16 @@ export class ParsePool {
    */
   private dead = false;
 
-  /** Generous enough for real flakiness, small enough to stop a spawn loop. */
-  private static readonly MAX_RESPAWNS = 16;
+  /**
+   * Generous enough for real flakiness, small enough to stop a spawn loop.
+   *
+   * Public for the same reason `SHUTDOWN_GRACE_MS` is: the test that pins the
+   * capped death derives its expectation from this rather than restating it.
+   * A hard-coded 17 there fails on a cap change with a message about the
+   * counter, and the tempting repair is to loosen the assertion into
+   * something that no longer catches the bug.
+   */
+  static readonly MAX_RESPAWNS = 16;
 
   private onError(w: Worker, _err: Error): void {
     // Not during shutdown. `destroy()` ends every worker on purpose, and
@@ -571,12 +610,37 @@ export class ParsePool {
     const idleIdx = this.idle.indexOf(w);
     if (idleIdx !== -1) this.idle.splice(idleIdx, 1);
 
-    // Before the cap branch, because a capped death still reacts fully --
-    // it splices `idle`, latches `dead` and drains the queue -- and a signal
-    // that means "the pool has finished reacting" has to advance for those
-    // too. Inside the branch it counted replacements instead, so past the cap
-    // it stopped moving and the `> before` wait below would hang on exactly
-    // the deaths a caller most wants to observe.
+    // Before the cap branch, because a death past the cap still reacts -- it
+    // has already spliced `workers` above, and `idle` too if it was idle (a
+    // worker that died mid-task is in `active`, so there is nothing to splice
+    // from the free list) -- and a signal meaning
+    // "the pool reacted to a death" has to advance for those too. Inside the
+    // branch it counted replacements instead, so past the cap it stopped
+    // moving, and the baseline wait described on `workerDeaths()` (~140 lines
+    // above) would hang on exactly the deaths a caller most wants to see.
+    //
+    // What the cap branch itself does -- the `if/else if` immediately below --
+    // depends on whether any worker is left. (Past the cap, that is. While the
+    // budget lasts the pool simply respawns and never latches `dead`.) With
+    // none, the `else if` latches `dead`, strands the queue and resolves it
+    // as crashed, then returns -- so that path never reaches `drain()`. With
+    // others still alive, NEITHER branch body runs and control falls straight
+    // through to `drain()`. `ingest.ts` builds the pool with
+    // `Math.max(1, os.cpus().length - 1)` and `respawns` is a pool-wide budget
+    // that any success resets, so on an ordinary machine the fall-through is
+    // the usual case -- do not read the cap as implying the pool is finished.
+    //
+    // The floor in that expression is there because 1 is reachable, and at
+    // concurrency 1 this inverts: the first death PAST the cap is also the last
+    // worker, so `workers.length === 0` always holds and the pool always
+    // latches `dead`. (Not the death that exhausts the budget -- that one
+    // still takes the respawn branch and spawns a replacement. The two are
+    // one apart, and this file is where that distinction has to stay
+    // straight.) Above concurrency 1 it does not invert. Which case a given machine falls
+    // into depends on its core count, and this comment deliberately does not
+    // say -- an earlier revision guessed at CI's and contradicted the machine
+    // sizes in `docs/parse-pool-teardown.md`, which is the file that owns
+    // them.
     this.deaths++;
 
     if (this.respawns < ParsePool.MAX_RESPAWNS) {

@@ -16,16 +16,32 @@ landed BEFORE the test file the real-ingest arm drives:
 |---|---|---|
 | `084f472` | #570 | last build with the `terminate()` teardown |
 | `20e1dae` | #598 | the fix -- teardown becomes `__shutdown` + `unref()` |
-| `b9b84ef` | #597 | adds `ingest-files.test.ts` |
+| `b9b84ef` | #597 | adds `ingest-files.test.ts` AND the loader's vm fallback |
 
 So:
 
-- The **minimal harness** arm runs at `084f472`.
+- The **minimal harness** arm runs at `084f472` -- but the harness itself is
+  not in the repo, at that commit or any other, and it produced the 6.3% that
+  is the numerator of the ratios that compare it to real ingests -- 28× and
+  3.86×, though not the 7× idle-vs-loaded further down, which is real against
+  real. So by this section's own standard it
+  is not reproducible either: the build is named, the program is not.
 - The **real-ingest** arm needs both, and no commit has both -- checked every
-  commit on `main`. It was measured on a hand-assembled tree: `b9b84ef`'s
-  `ingest-files.test.ts` over `084f472`'s `parse-pool.ts`. An earlier revision
-  of this file said "check out `084f472`", which gives "no such file". Say the
-  recipe or the arm is not reproducible.
+  commit on `main`. It was measured on a hand-assembled tree: `084f472`, plus
+  TWO files from `b9b84ef` --
+
+      ix-cli/src/cli/__tests__/ingest-files.test.ts   the harness itself
+      ix-cli/src/cli/commands/ingestion-loader.ts     or it cannot run at all
+
+  The loader is not optional. `loadIngestionModules` reaches the built
+  `core-ingestion` through `new Function("return import(specifier)")`, and
+  inside vitest's vm context that throws `A dynamic import callback was not
+  specified`. `b9b84ef` added the fallback for exactly that; `084f472` has the
+  indirection and no fallback, so the ONE-file recipe an earlier revision of
+  this section gave -- the test file alone -- throws on the first `run()` and
+  measures zero ingests, not twelve. That is what the second file above
+  fixes. Before that it said "check out `084f472`", which gives "no such
+  file". Say the whole recipe or the arm is not reproducible.
 - The **vitest** check needs the CURRENT tree, not either of those: its
   "36 of 38" is today's count.
 
@@ -80,7 +96,17 @@ demonstration of agreement.
 **Real ingests** — `ingest-files.test.ts` under vitest. That file drives a
 FIXED number of ingests per process, not an average: **12** at `b9b84ef`, the
 version measured (14 today). The per-teardown rate is `1-(1-p)^12` solved
-against the process counts:
+against the process counts.
+
+The exponent is TEARDOWNS, and 12 is the ingest count, so that step rests on a
+premise worth writing down: `ingestFiles` creates its pool lazily, through
+`ensureParsePool()`, so an ingest that parses no file tears nothing down. Every
+ingest in that file parses at least one — the `fixture(N)` calls are all
+N > 0, with `force: true` — so ingests and teardowns coincide there. Add an
+empty-repo or unsupported-extension case and they stop coinciding, and
+updating this
+exponent to the new ingest count would understate the rate with nothing red.
+That is the same unrecorded-derivation failure that made 9.5 unfalsifiable.
 
 | configuration | result | per POOL teardown |
 |---|---|---|
@@ -125,9 +151,15 @@ writing down.
 
 The minimal harness overstates real exposure by **28×** on the only
 load-matched comparison available (idle vs idle). Against the loaded real rate
-it is 3.9×, but that mixes conditions — the harness was never run loaded, and
-load raises the rate — so treat 3.9× as a lower bound on what is unexplained,
-not the residue after subtracting load.
+it is **3.86×** (6.3267 / 1.6397; the printed 6.3 / 1.64 gives 3.84, which is
+why this one is written to two decimals rather than rounded into an
+ambiguity). An earlier revision labelled 6.327 / 1.640 as "the unrounded MLE
+over the unrounded loaded rate" -- both are themselves rounded, and a reader
+following this file's own convention would recompute from the real values and
+think one of the two paragraphs wrong. That comparison mixes
+conditions — the harness was never run loaded, and load raises the rate — so
+treat it as a lower bound on what is unexplained, not the residue after
+subtracting load.
 
 **Parses per worker is not controlled.** `ingestFiles` parses a `.ts` file
 twice (index prescan, then streaming loop, both on the same pool), so file
@@ -200,7 +232,13 @@ falsification it does not support.
 
 The 6.3% is per POOL teardown, and a pool disposes 21 isolates. Treating
 those disposals as independent gives `1-(1-h)^21 = 0.063`, i.e. **h = 0.31%**
-— a factor of 20.5, and for a pool of 21 that is the only shape the answer can
+— a factor of **20.4** (6.3267 / 0.3107; the printed figures give 20.3). The
+fifth digit on the MLE is why h shows 0.3107 and not 0.3108: recomputing from
+a 4-digit 6.327 gives the latter. It changes nothing above -- 6.3267/0.3108 is
+20.36 and still rounds to 20.4 -- but this is the paragraph about a
+mis-rounded conversion factor, so the operand that actually reproduces the
+printed one is the one to give. And
+for a pool of 21 that is the only shape the answer can
 take: at small h the pool rate is about 21h, so the ratio can approach 21 and
 never exceed it. Any conversion factor larger than the pool size is arithmetic
 that went wrong, which is how a bad conversion factor quoted here in an
@@ -221,8 +259,16 @@ either way, which is why it is stated rather than hedged away: redo it with
 the real-ingest IDLE hazard instead — 0.225% per pool over 21 isolates is
 h = 1.07e-4, and 36 terminated isolates over 10 runs gives **0.96** — against
 0.33, both unremarkable. Nothing here rests on the exact h. (An earlier
-revision said 0.95; the stated inputs give 0.962, and every other figure in
-this file reproduces to the digit.)
+revision said 0.95. That was not an arithmetic slip -- 0.95 is what the
+withdrawn 0.28% idle rate gives (0.953, which the file rounded to 0.95) -- it
+moved because the rate
+under it did.) Do not read that as "and
+everything else is exact" — an earlier revision of this parenthetical said so
+and was wrong in the same breath: the conversion factor earlier in this same
+section read 20.5 where its own inputs give 20.4. Ratios here are quoted from
+unrounded
+inputs, so recomputing from the ROUNDED figures printed beside them can differ
+in the last digit; where that changes the rounding, the operands are given.
 
 How many addon-loaded isolates a run terminates is not a guess: `isolate`
 defaults to `true`, `core-ingestion` ships no vitest config to change it, and

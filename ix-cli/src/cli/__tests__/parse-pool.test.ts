@@ -114,12 +114,19 @@ describe("ParsePool", () => {
     } catch (err) {
       // EEXIST is the expected answer: another thread holds the claim.
       // Anything else means THIS thread failed to claim for an unrelated
-      // reason, and if it was the first thread the next one claims
-      // successfully and the run looks entirely normal -- one arming, one
-      // respawn, green. A previous revision rethrew here and claimed that
-      // surfaced the problem; it does not, it just moves which thread
-      // faults. So record it instead, and let the test assert the absence
-      // of this file. Best-effort: if this write fails too there is
+      // reason, and the two cases differ:
+      //
+      //   the FIRST thread fails  -- at concurrency 1 it is the only worker,
+      //     so isFaulter stays false, nothing ever throws, nothing dies
+      //     and nothing respawns. The run is NOT green; it fails in
+      //     waitUntil, which reads this file to say so.
+      //   a REPLACEMENT fails     -- the fault already happened, so the test
+      //     reaches its assertions, and the .failed check below is what
+      //     catches it.
+      //
+      // Recorded rather than rethrown for both. A previous revision rethrew
+      // and claimed that surfaced the problem; it does not -- it only moves
+      // which thread faults. Best-effort: if this write fails too there is
       // nothing left to say with.
       if (err.code !== 'EEXIST') {
         try {
@@ -228,9 +235,16 @@ describe("ParsePool", () => {
     // delivered before the two parses below went out. The test then failed on
     // `b2.ts` coming back null, which looks exactly like the bug it guards.
     //
-    // `workerDeaths()` is the pool's own signal that `onError` ran to
-    // completion, so this waits on the state the test actually depends on and
-    // is done as soon as it holds.
+    // `workerDeaths()` is the pool's own signal that `onError` has REACTED to
+    // a death -- it advances before `spawnWorker()` and `drain()`, so it means
+    // begun, not finished. That is enough here, and not because of the poll
+    // interval: `waitUntil` evaluates its condition once SYNCHRONOUSLY before
+    // any timer, so a 5ms tick guarantees nothing. What guarantees it is that
+    // this test body is async and so cannot be running inside `onError` --
+    // the handler has always returned before any line here executes. The
+    // distinction matters to anyone copying the `workerDeaths() > before`
+    // pattern into a synchronous callback, which the accessor's own doc
+    // warns against.
     // `> 0` is only correct because this is the FIRST death of the run. The
     // counter is monotonic and never resets, so a second wait written this
     // way returns immediately -- a silent no-op, which is the same class of
@@ -311,12 +325,41 @@ describe("ParsePool", () => {
     // A worker that dies deterministically on construction burns through the
     // cap. Draining only the queue that existed at that instant left every
     // LATER parse waiting on a `drain()` that is a no-op with no idle workers.
-    const pool = new ParsePool(worker("dead", BORN_DEAD), 1);
+    // Named, because the death count below is derived from it as well as from
+    // the cap -- see there.
+    const concurrency = 1;
+    const pool = new ParsePool(worker("dead", BORN_DEAD), concurrency);
     pool.init();
 
-    // Enough calls to outlast the cap, then more after it.
+    // Enough calls to outlast the cap, DERIVED from it. A hard-coded depth
+    // makes the derivation below one-directional: lowering `MAX_RESPAWNS`
+    // still works, but raising it past that depth means the queue drains
+    // before the pool reaches the latch, and the death assertion then fails
+    // with a message accusing the counter -- which is the exact failure the
+    // derivation exists to prevent. `MAX_RESPAWNS` is documented as tunable,
+    // so that is a reachable edit, not a hypothetical one.
+    const postLatch = 3; // the parses issued below, after the pool is dead
+    // Headroom, so the queue is still non-empty when `dead` latches. Unrelated
+    // to `postLatch` above; they are equal by coincidence, and unifying them
+    // would invent a coupling that does not exist.
+    //
+    // This is the constant that makes this test exercise the branch it is
+    // named for, and it is worth knowing that no other assertion here
+    // protects it: both of the ones below hold at `headroom = 0` too, because
+    // then every queued task is consumed by a death and none is stranded.
+    // Mutation-checked -- deleting the strand-and-resolve body from the cap
+    // branch in `parse-pool.ts` SURVIVES at 0 and is killed at 3, where the
+    // three stranded parses never settle and this hangs to the timeout. So
+    // trimming it silently turns a queue-stranding test into one that only
+    // covers in-flight losses.
+    const headroom = 3;
+    const queued = ParsePool.MAX_RESPAWNS + concurrency + headroom;
+    expect(
+      headroom,
+      "headroom is this test's coverage of the stranded-queue path, not slack",
+    ).toBeGreaterThan(0);
     const first = await Promise.all(
-      Array.from({ length: 20 }, (_, i) => pool.parse(`f${i}.ts`, "x")),
+      Array.from({ length: queued }, (_, i) => pool.parse(`f${i}.ts`, "x")),
     );
     expect(first.every((r) => r === null)).toBe(true);
 
@@ -326,8 +369,51 @@ describe("ParsePool", () => {
       Promise.all([pool.parse("l1.ts", "x"), pool.parse("l2.ts", "x")]),
     ).resolves.toEqual([null, null]);
 
-    // And every one of them is counted, so the stitch gate sees the loss.
-    expect(pool.crashedTasks()).toBeGreaterThanOrEqual(23);
+    // And every one of them is counted, so the stitch gate sees the loss: the
+    // whole queued batch plus every parse issued after the latch. EXACT, not
+    // a floor -- this was the last loose assertion in a test tightened
+    // everywhere else, and a floor cannot see an over-count. A regression
+    // that counted the stranded queue twice (the `else if` branch's
+    // `crashed += stranded` plus `parse()`'s own `if (this.dead)`) raises the
+    // number and slides under a `>=`.
+    expect(pool.crashedTasks()).toBe(queued + postLatch);
+
+    // The death that hits the cap still counts. This is the only place that
+    // pins it: every other use of `workerDeaths()` watches the FIRST death of
+    // a healthy pool, where a counter incremented inside the respawn branch
+    // and one incremented outside it both read 1, so neither placement is
+    // distinguishable there. Here they are not equal -- `MAX_RESPAWNS` is 16,
+    // so the pool takes `MAX_RESPAWNS + concurrency` deaths: every worker it
+    // ever starts dies, and it starts `concurrency` up front plus one per
+    // respawn until the budget is gone. The last `concurrency` of them fall
+    // outside the branch -- one only when the pool is size 1, which is what
+    // it is here. Derived from BOTH constants, because at concurrency N the
+    // initial N-1 extra workers also die before `workers.length === 0` can
+    // latch `dead` -- so a bare `MAX_RESPAWNS + 1` silently means "and the
+    // pool is size 1", and raising the size here would fail this assertion
+    // with a message accusing the death counter.
+    //
+    // Asserted EXACTLY, and DERIVED from the constant rather than restated.
+    // A loose `>` form pins the placement only by accident of the cap's
+    // value: an increment moved back inside the branch yields exactly
+    // `MAX_RESPAWNS`, so `> MAX_RESPAWNS` happens to catch it, but any
+    // "more than roughly the cap" shape stops discriminating the moment
+    // someone reaches for a rounder number. And a hard-coded 17 fails a cap
+    // change with a message about the counter, where the tempting repair is
+    // to loosen the assertion into one that no longer catches the bug.
+    // `MAX_RESPAWNS` is public for exactly this, the way
+    // `SHUTDOWN_GRACE_MS` already is for the teardown-bound test below.
+    //
+    // Without this the increment can be tidied back into the branch with the
+    // suite green, and the `const before = ...` / `> before` wait that
+    // `workerDeaths()`'s own doc prescribes then hangs forever past the cap.
+    expect(
+      pool.workerDeaths(),
+      "expected MAX_RESPAWNS + concurrency deaths: every worker the pool " +
+        "starts dies. The shortfall is the deaths PAST the cap -- the ones " +
+        "that exhaust the budget are still counted either way, so a count of " +
+        "exactly MAX_RESPAWNS means the post-cap deaths stopped being counted",
+    ).toBe(ParsePool.MAX_RESPAWNS + concurrency);
 
     await pool.destroy();
   });
