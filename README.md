@@ -24,6 +24,25 @@
   <a href="https://discord.gg/ncEYVHVqZ8">Discord</a>
 </p>
 
+## Kartr
+
+**[Kartr](https://www.ix-infra.com)** is an agent platform built on the same memory
+engine we use for Ix, extended to the sources a codebase does not contain: docs and
+files, email and calendar, meetings and notes, and team chat. Agents carry context
+across all of them.
+
+Kartr is in alpha and onboarding early users.
+
+<p align="center">
+  <a href="https://docs.google.com/forms/d/e/1FAIpQLSdh5IXVGW9mNBUtyBAsP_uysS38GgilpTNMbKRAVQf1FZ1eBg/viewform?usp=pp_url&amp;entry.2087374943=ix_github" target="_blank" rel="noopener noreferrer">
+    <img src="https://img.shields.io/badge/Sign%20up%20for%20the%20Kartr%20alpha-%E2%86%92-8A2BE2?style=for-the-badge" alt="Sign up for the Kartr alpha" />
+  </a>
+</p>
+
+---
+
+## Try Ix
+
 ```bash
 curl -fsSL https://ix-infra.com/install.sh | sh    # macOS / Linux
 ```
@@ -31,10 +50,6 @@ curl -fsSL https://ix-infra.com/install.sh | sh    # macOS / Linux
 <p align="center">
   <img src="./assets/demo.gif" width="90%" alt="Ix mapping and querying a repository" />
 </p>
-
----
-
-## Try it
 
 ```bash
 ix map .                      # build the graph for this repo
@@ -278,21 +293,6 @@ graph. Python stub files (`.pyi`) are parsed as Python.
 
 Also recognized as config and data formats: `YAML` `JSON` `TOML` `SQL`
 `Protocol Buffers` `Dockerfile` `Markdown` `LaTeX`
-
-## Built on Ix: Kartr
-
-Ix maps your code. **[Kartr](https://www.ix-infra.com)** is an agent platform built on
-the same memory engine, extended to the sources a codebase does not contain — docs and
-files, email and calendar, meetings and notes, team chat — so agents carry context
-across all of them.
-
-Kartr is in alpha and onboarding early users.
-
-<p align="center">
-  <a href="https://docs.google.com/forms/d/e/1FAIpQLSdh5IXVGW9mNBUtyBAsP_uysS38GgilpTNMbKRAVQf1FZ1eBg/viewform?usp=pp_url&amp;entry.2087374943=ix_github" target="_blank" rel="noopener noreferrer">
-    <img src="https://img.shields.io/badge/Sign%20up%20for%20the%20Kartr%20alpha-%E2%86%92-8A2BE2?style=for-the-badge" alt="Sign up for the Kartr alpha" />
-  </a>
-</p>
 
 ## Status
 
