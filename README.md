@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="./ix-cli/assets/logo.png" width="34%" alt="Ix" />
+  <img src="./assets/readme-logo.png" width="34%" alt="Ix" />
 </p>
 
-<h1 align="center">Give your AI a map of your codebase.</h1>
+<h1 align="center">Understand any codebase instantly.</h1>
+<p align="center"><em>System intelligence for humans and AI.</em></p>
 
 <p align="center">
   Ix parses your repository into a persistent system graph — symbols, calls, imports, relationships —<br/>
